@@ -1,0 +1,162 @@
+import { ApiError } from './api.js';
+import { STRATEGY, localTime, cycleAt, clock } from './schedule.js';
+export { STRATEGY, localTime } from './schedule.js';
+
+export function normalizeHarness(text) { return text.replace(/\r\n/g, '\n').trim(); }
+export function validateAccount(account) {
+  if (!Number.isFinite(account.balance_usdg) || !Array.isArray(account.open) || !Array.isArray(account.closed)
+      || account.open.some(p => !Number.isSafeInteger(p.id) || p.id <= 0)) {
+    throw new Error('Contrato /account inesperado; no se enviaron nuevas ordenes');
+  }
+  return account;
+}
+// Regla de Undeadwallet: una asset key por activo y por bot.
+export function keyAsset(account) {
+  const asset = account.key_account?.asset;
+  if (typeof asset !== 'string' || !asset) throw new Error('Se acepta una asset key por activo y por bot: esta key no está atada a un activo. Crea en Undeadwallet una key de un solo activo.');
+  return asset;
+}
+
+export class Bot {
+  constructor({ api, store, harness, strategy = STRATEGY, initialCapital = Infinity, mode = 'dry-run', now = () => new Date(), log = () => {} }) {
+    this.api = api;
+    this.store = store;
+    this.harness = normalizeHarness(harness);
+    this.mode = mode;
+    this.strategy = strategy;
+    this.initialCapital = initialCapital;
+    this.now = now;
+    this.log = log;
+    this.state = store.load();
+    this.started = now();
+    this.previewed = new Set();
+  }
+
+  async save() { await this.store.save(this.state); }
+  async pause(message) {
+    this.state.paused = message;
+    await this.save();
+    this.log('paused', { reason: message });
+  }
+
+  async check() {
+    const learned = await this.api.learn();
+    const account = validateAccount(await this.api.account());
+    const assets = await this.api.assets();
+    if (!Array.isArray(assets.assets)) throw new Error('Contrato /assets inesperado');
+    return {
+      apiReady: true,
+      learnVersion: learned.learn_version,
+      balance: account.balance_usdg,
+      openPositions: account.open.length,
+      symbolsAvailable: this.strategy.symbols.every(s => assets.assets.some(a => a.symbol === s)),
+    };
+  }
+
+  async tick() {
+    if (this.state.paused) return;
+    try { await this.runTick(); }
+    catch (error) { await this.pause(error.message); }
+  }
+
+  async runTick() {
+    const current = localTime(this.now());
+    const pending = Object.values(this.state.days).some(d => Object.values(d).some(v => v.status === 'pending'));
+    if (pending) throw new Error('Apertura incierta pendiente de conciliacion manual; no se repetira');
+    const due = this.state.positions.filter(p => p.status !== 'closed' && (p.day < current.day || (p.day === current.day && current.seconds >= (p.closeSeconds ?? 64500))));
+    if (due.length) {
+      await this.api.learn(); // La API marca la key con la version vigente antes de operar.
+      const account = validateAccount(await this.api.account());
+      for (const p of due) {
+        if (!account.open.some(a => a.id === p.id)) {
+          p.status = 'closed';
+          const closed = account.closed.find(a => a.id === p.id);
+          if (Number.isFinite(closed?.pnl)) p.pnl = closed.pnl;
+          p.closedAt = this.now().toISOString();
+          await this.save();
+          this.log('already_closed', { id: p.id });
+          continue;
+        }
+        if (p.status === 'closing') throw new Error(`Cierre incierto de ${p.id}; revisar manualmente`);
+        if (this.mode === 'dry-run') {
+          this.preview(`close-${p.id}`, { action: 'close', id: p.id });
+          continue;
+        }
+        p.status = 'closing';
+        await this.save();
+        try {
+          const result = await this.api.close({ id: p.id, note: `undeadbot: cierre programado ${clock(p.closeSeconds ?? 64500)} America/Monterrey; entrada ${p.cycle ?? p.day} ${p.symbol}` });
+          if (Number.isFinite(result.pnl)) p.pnl = result.pnl;
+        } catch (error) {
+          if (error instanceof ApiError && !error.uncertain) { p.status = 'open'; await this.save(); }
+          throw error;
+        }
+        p.status = 'closed';
+        p.closedAt = this.now().toISOString();
+        await this.save();
+        this.log('closed', { id: p.id, symbol: p.symbol });
+      }
+    }
+    // Una clave por ciclo, conservando los registros diarios de la version anterior.
+    const cycle = cycleAt(this.now());
+    const started = localTime(this.started);
+    if (current.seconds < cycle.open || current.seconds >= cycle.open + 60
+        || (started.day === current.day && started.seconds >= cycle.open)
+        || this.state.days[cycle.key] || this.state.positions.some(p => p.status !== 'closed')) return;
+    if (this.mode === 'dry-run' && this.previewed.has(cycle.key)) return;
+    await this.api.learn();
+    const account = validateAccount(await this.api.account());
+    const asset = keyAsset(account);
+    if (this.strategy.symbols.some(s => s !== asset)) throw new Error(`Esta key solo opera ${asset}; guarda de nuevo la configuración del espacio`);
+    const entries = this.strategy.entries || this.strategy.symbols.map(symbol => ({ symbol, margin: this.strategy.margin, leverage: this.strategy.leverage, direction: this.strategy.direction || 'long' }));
+    const totalMargin = entries.reduce((sum, p) => sum + p.margin, 0);
+    const capital = this.initialCapital + this.state.positions.filter(p => p.status === 'closed').reduce((sum, p) => sum + (Number.isFinite(p.pnl) ? p.pnl : 0), 0);
+    if (Math.min(account.balance_usdg, capital) < totalMargin) throw new Error('Saldo o capital del espacio insuficiente para el margen configurado');
+    const assets = await this.api.assets();
+    if (!Array.isArray(assets.assets) || this.strategy.symbols.some(s => !assets.assets.some(a => a.symbol === s && Number.isFinite(a.price_usd) && a.price_usd > 0))) {
+      throw new Error('Falta un activo o un precio valido en /assets');
+    }
+    if (this.mode === 'dry-run') {
+      this.preview(cycle.key, { action: 'open', symbols: this.strategy.symbols, margin: this.strategy.margin, leverage: this.strategy.leverage, entries });
+      return;
+    }
+    this.state.days[cycle.key] = {};
+    await this.save();
+    for (const entry of entries) {
+      const { symbol, margin, leverage, direction } = entry;
+      const time = localTime(this.now());
+      if (time.day !== current.day || time.seconds < cycle.open || time.seconds >= cycle.open + 60) {
+        this.log('entry_window_missed', { symbol });
+        break;
+      }
+      const record = { status: 'pending' };
+      this.state.days[cycle.key][symbol] = record;
+      await this.save(); // Persistir la intencion ANTES de enviar la orden.
+      let result;
+      try {
+        result = await this.api.open({ symbol, direction, size_usd: margin, leverage,
+          note: `undeadbot:${cycle.key}:${symbol}:${direction}; margen ${margin} USDG; ${leverage}x; cierre ${clock(cycle.close)} America/Monterrey` });
+      } catch (error) {
+        if (error instanceof ApiError && !error.uncertain) { record.status = 'rejected'; await this.save(); }
+        throw error;
+      }
+      const p = result.position;
+      if (!p || !Number.isSafeInteger(p.id) || p.id <= 0 || p.symbol !== symbol || p.direction !== direction || p.status !== 'open'
+          || this.state.positions.some(old => old.id === p.id)) {
+        throw new Error('Respuesta de apertura inesperada; revisar la cuenta sin repetir la orden');
+      }
+      record.status = 'opened';
+      record.id = p.id;
+      this.state.positions.push({ id: p.id, symbol, direction, day: current.day, cycle: cycle.key, closeSeconds: cycle.close,
+        margin, leverage, openedAt: this.now().toISOString(), status: 'open' });
+      await this.save();
+      this.log('opened', { id: p.id, symbol });
+    }
+  }
+
+  preview(key, detail) {
+    if (this.previewed.has(key)) return;
+    this.previewed.add(key);
+    this.log('dry_run', detail);
+  }
+}
